@@ -19,6 +19,7 @@ namespace tmgr {
 		lock,
 		end_of_life,
 		has_solve,
+		exception,
 	};
 
 	class thread_exception : public std::exception {
@@ -41,7 +42,7 @@ namespace tmgr {
 	class broadcast_event_class : public broadcast_event {
 		_Cl* cl;
 	public:
-		broadcast_event_class(_Cl* _cl) : cl(_cl) {}
+		broadcast_event_class(_Cl* _cl) noexcept : cl(_cl) {}
 		void operator()() final {
 			cl->handle();
 		}
@@ -57,9 +58,9 @@ namespace tmgr {
 	class broadcast_event_lambda : public broadcast_event {
 		_Fn* _f;
 	public:
-		broadcast_event_lambda(_Fn& _Fx) : _f(&_Fx) {
+		broadcast_event_lambda(_Fn& _Fx) noexcept : _f(&_Fx) {
 		}
-		broadcast_event_lambda(_Fn _Fx) : _f(&_Fx) {
+		broadcast_event_lambda(_Fn _Fx) noexcept : _f(&_Fx) {
 		}
 		void operator()() final {
 			(*_f)();
@@ -78,22 +79,22 @@ namespace tmgr {
 	namespace this_thread {
 		inline void wanna_execute();
 		inline void has_solve(void* solve_ptr);
-		inline void sleep_microsec(unsigned long long microsecond);
-		inline void sleep_nanosec(unsigned long long nanosecond);
-		inline void sleep_sec(unsigned long long second);
 		template <class _Rep, class _Period>
-		void sleep(const std::chrono::duration<_Rep, _Period>& _Rel_time);
+		void sleep_for(const std::chrono::duration<_Rep, _Period>& _Rel_time);
+		template <class _Clock, class _Duration>
+		void sleep_until(const std::chrono::time_point<_Clock, _Duration>& _Abs_time);
 	}
 
 
 	class thread_context_t {
 		friend class thread_object_t;
 		friend class spin_lock;
-		friend void this_thread::sleep_microsec(unsigned long long);
-		friend void this_thread::sleep_nanosec(unsigned long long);
-		friend void this_thread::sleep_sec(unsigned long long); 
+
 		template <class _Rep, class _Period>
-		friend void this_thread::sleep(const std::chrono::duration<_Rep, _Period>& _Rel_time);
+		friend void this_thread::sleep_for(const std::chrono::duration<_Rep, _Period>& _Rel_time);
+		template <class _Clock, class _Duration>
+		friend void sleep_until(const std::chrono::time_point<_Clock, _Duration>& _Abs_time);
+
 		friend void this_thread::wanna_execute();
 		friend void this_thread::has_solve(void*);
 		friend shared_ptr_custom<void> get_result(thread_context_t& context);
@@ -127,15 +128,17 @@ namespace tmgr {
 
 
 		bool abort:1;
-		thread_status current_status : 7;
+		bool exception_catched : 1;
+		thread_status current_status : 6;
 		std::thread::id current = std::this_thread::get_id();
 		shadow_spin_lock handlers_mutex;
 		shared_ptr_custom<void> thread_result = nullptr;
 		std::list<broadcast_event*> stat_handle;
+		std::exception_ptr exception_memory;
 
 		std::atomic_flag is_pause;
 	public:
-		thread_context_t() : abort(0), current_status(thread_status::starting){}
+		thread_context_t() noexcept : abort(0), exception_catched(0), current_status(thread_status::starting) {}
 		~thread_context_t() {
 			broadcast_status(thread_status::end_of_life);
 		}
@@ -166,87 +169,94 @@ namespace tmgr {
 		std::thread::id get_id() const {
 			return current;
 		}
+		std::exception_ptr get_exception() {
+			return exception_memory;
+		}
+		void exception_catch() {
+			if (exception_memory) {
+				exception_catched = 1;
+			}
+			else throw std::invalid_argument("Exception not exist");
+		}
 	};
 
 
-	extern thread_local thread_context_t current_context;
+	extern thread_local thread_context_t *current_context;
 
 
 	namespace this_thread {
 		inline void wanna_execute() {
-			if (current_context.abort)
+			if (current_context->abort)
 				throw thread_context_t::thread_abort();
-			if (current_context.is_pause.test(std::memory_order_acquire)) {
-				current_context.broadcast_status(thread_status::lock);
-				while (current_context.is_pause.test_and_set(std::memory_order_acquire))
+			if (current_context->is_pause.test(std::memory_order_acquire)) {
+				current_context->broadcast_status(thread_status::lock);
+				while (current_context->is_pause.test_and_set(std::memory_order_acquire))
 					std::this_thread::sleep_for(std::chrono::microseconds(15));
-				current_context.is_pause.clear();
+				current_context->is_pause.clear();
 			}
-			current_context.broadcast_status(thread_status::work);
+			current_context->broadcast_status(thread_status::work);
 		}
-
 		inline void has_solve(void* solve_ptr) {
-			current_context.thread_result = solve_ptr;
-			current_context.broadcast_status(thread_status::has_solve);
-			if (current_context.abort)
+			current_context->thread_result = solve_ptr;
+			current_context->broadcast_status(thread_status::has_solve);
+			if (current_context->abort)
 				throw thread_context_t::thread_abort();
 			wanna_execute();
 		}
 
-
-		inline void sleep_microsec(unsigned long long microsecond) {
-			if (current_context.abort)
-				throw thread_context_t::thread_abort();
-			current_context.broadcast_status(thread_status::sleep);
-			std::this_thread::sleep_for(std::chrono::microseconds(microsecond));
-			wanna_execute();
-		}
-
-		inline void sleep_nanosec(unsigned long long nanosecond) {
-			if (current_context.abort)
-				throw thread_context_t::thread_abort();
-			current_context.broadcast_status(thread_status::sleep);
-			std::this_thread::sleep_for(std::chrono::nanoseconds(nanosecond));
-			wanna_execute();
-		}
-
-		inline void sleep_sec(unsigned long long second) {
-			if (current_context.abort)
-				throw thread_context_t::thread_abort();
-			current_context.broadcast_status(thread_status::sleep);
-			std::this_thread::sleep_for(std::chrono::seconds(second));
-			wanna_execute();
-		}
 		template <class _Rep, class _Period>
-		void sleep(const std::chrono::duration<_Rep, _Period>& _Rel_time){
-			if (current_context.abort)
+		void sleep_for(const std::chrono::duration<_Rep, _Period>& _Rel_time){
+			if (current_context->abort)
 				throw thread_context_t::thread_abort();
-			current_context.broadcast_status(thread_status::sleep);
+			current_context->broadcast_status(thread_status::sleep);
 			std::this_thread::sleep_for(_Rel_time);
 			wanna_execute();
+		}
+
+		template <class _Clock, class _Duration>
+		void sleep_until(const std::chrono::time_point<_Clock, _Duration>& _Abs_time){
+			if (current_context->abort)
+				throw thread_context_t::thread_abort();
+			current_context->broadcast_status(thread_status::sleep);
+			std::this_thread::sleep_until(_Abs_time);
+			wanna_execute();
+		}
+
+		inline std::thread::id get_id() noexcept {
+			return std::this_thread::get_id();
 		}
 	}
 
 
 	template<class FN>
 	static void thread_context_t::start_new_thread(thread_context_t** creat, FN run_f) {
+		*creat = current_context = new thread_context_t();
 		try {
-			*creat = &current_context;
 			run_f();
 		}
-		catch (const thread_context_t::thread_abort&) {};
-		current_context.broadcast_status(thread_status::end_of_life);
+		catch (const thread_context_t::thread_abort&) {}
+		catch (...) {
+			current_context->exception_memory = std::current_exception();
+			current_context->broadcast_status(thread_status::exception);
+			if (!current_context->exception_catched)exit(3);
+		}
+		delete current_context;
 	}
 	template<class FN>
 	static void thread_context_t::start_new_locked_thread(thread_context_t** creat, FN run_f) {
+		*creat = current_context = new thread_context_t();
 		try {
-			*creat = &current_context;
-			current_context.is_pause.test_and_set(std::memory_order_acquire);
+			current_context->is_pause.test_and_set(std::memory_order_acquire);
 			this_thread::wanna_execute();
 			run_f();
 		}
-		catch (const thread_context_t::thread_abort&) {};
-		current_context.broadcast_status(thread_status::end_of_life);
+		catch (const thread_context_t::thread_abort&) {}
+		catch (...) {
+			current_context->exception_memory = std::current_exception();
+			current_context->broadcast_status(thread_status::exception);
+			if (!current_context->exception_catched)exit(3);
+		}
+		delete current_context;
 	}
 
 
@@ -285,7 +295,7 @@ namespace tmgr {
 	}
 
 	inline shared_ptr_custom<void> get_result(thread_context_t& context) {
-		if (&context == &current_context) throw thread_exception("Self lock");
+		if (&context == current_context) throw thread_exception("Self lock");
 		bool destructed = 0;
 		std::atomic_flag lock_flag;
 
@@ -299,14 +309,14 @@ namespace tmgr {
 		});
 
 		context.sub_status(tmpy);
-		current_context.broadcast_status(thread_status::wait);
+		current_context->broadcast_status(thread_status::wait);
 		while (lock_flag.test_and_set(std::memory_order_acquire)) {
 			if (destructed) break;
 			std::this_thread::sleep_for(std::chrono::microseconds(15));
 		}
 		auto tmp = context.thread_result;
 		context.unsub_status(tmpy);
-		current_context.broadcast_status(thread_status::work);
+		current_context->broadcast_status(thread_status::work);
 		return tmp;
 	}
 }

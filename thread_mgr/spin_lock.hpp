@@ -17,11 +17,11 @@ namespace tmgr {
 		}
 		void lock() {
 			while (lock_flag.test_and_set(std::memory_order_acquire)) {
-				current_context.broadcast_status(thread_status::lock);
+				current_context->broadcast_status(thread_status::lock);
 				std::this_thread::sleep_for(std::chrono::microseconds(15));
 			}
 			tmp = std::this_thread::get_id();
-			current_context.broadcast_status(thread_status::work);
+			current_context->broadcast_status(thread_status::work);
 		}
 		bool try_lock() {
 			return !lock_flag.test_and_set(std::memory_order_acquire);

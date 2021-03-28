@@ -35,13 +35,13 @@ namespace tmgr {
 		void prepare_result() {
 			if (destructed) throw thread_exception("Thread death");
 			if (async_result) {
-				current_context.broadcast_status(thread_status::wait);
+				current_context->broadcast_status(thread_status::wait);
 				wait_async_the_thread_result.test_and_set(std::memory_order_acquire);
 				while (wait_async_the_thread_result.test_and_set(std::memory_order_acquire)) {
 					if (destructed) break;
 					std::this_thread::sleep_for(std::chrono::microseconds(15));
 				}
-				current_context.broadcast_status(thread_status::work);
+				current_context->broadcast_status(thread_status::work);
 			}
 			else result_list.emplace_back(get_result(*thread_handle));
 		}
@@ -92,11 +92,11 @@ namespace tmgr {
 			);
 			if (!destructed)thread_handle->sub_status(tmpy);
 			while (lock_flag.test_and_set(std::memory_order_acquire)) {
-				current_context.broadcast_status(thread_status::wait);
+				current_context->broadcast_status(thread_status::wait);
 				if (destructed) break;
 				std::this_thread::sleep_for(std::chrono::microseconds(15));
 			}
-			current_context.broadcast_status(thread_status::work);
+			current_context->broadcast_status(thread_status::work);
 			if (!destructed)thread_handle->unsub_status(tmpy);
 			else if (need_status_type != thread_status::end_of_life) throw thread_exception("Thread death");
 		}
@@ -155,7 +155,6 @@ namespace tmgr {
 			thread_handle->abort = 1;
 		}
 
-
 		bool isDeath() const {
 			return destructed;
 		}
@@ -175,5 +174,43 @@ namespace tmgr {
 				thread_handle->unsub_status(tmp);
 		}
 	};
+
+	template<class EX_T>
+	class thread_exception_handler {
+		bool destructed = 0;
+		void (*_f)(EX_T);
+		thread_context_t* thread_handle;
+		friend class broadcast_event_class<thread_exception_handler>;
+		broadcast_event_class<thread_exception_handler> tmp = broadcast_event_class<thread_exception_handler>(this);
+		void handle() {
+			if (thread_handle->get_status() == thread_status::end_of_life)
+				destructed = 1;
+			if (thread_handle->get_status() == thread_status::exception) {
+				try {
+					std::rethrow_exception(thread_handle->get_exception());
+				}
+				catch(EX_T ex){
+					_f(ex);
+					thread_handle->exception_catch();
+				}
+				catch(...){}
+			}
+		}
+	public:
+		thread_exception_handler(thread_context_t& thread,void (*_function)(EX_T)) : thread_handle(&thread) {
+			if (thread_handle) {
+				thread_handle->sub_status(tmp);
+				destructed = 0;
+			}
+			else destructed = 1;
+			_f = _function;
+		}
+		~thread_exception_handler() {
+			if (!destructed)
+				thread_handle->unsub_status(tmp);
+		}
+
+	};
+
 }
 #endif
