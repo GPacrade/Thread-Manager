@@ -30,14 +30,8 @@ namespace tmgr {
 		shared_ptr_custom(T* copy) {
 			*this = copy;
 		}
-		shared_ptr_custom(shared_ptr_custom& copy) {
-			*this = copy;
-		}
-		shared_ptr_custom(shared_ptr_custom&& copy) noexcept {
-			*this = copy;
-		}
-		~shared_ptr_custom() {
-			exit();
+		shared_ptr_custom(const shared_ptr_custom& copy) {
+			*this = *const_cast<shared_ptr_custom*>(&copy);
 		}
 		shared_ptr_custom& operator=(T* copy) {
 			if (ptr == copy)return *this;
@@ -46,13 +40,11 @@ namespace tmgr {
 			total = new std::atomic_size_t{ 1 };
 			return *this;
 		}
-		shared_ptr_custom& operator=(shared_ptr_custom& copy) {
-			if (this == &copy)return *this;
-			join(copy.total);
-			ptr = copy.ptr;
-			return *this;
+		shared_ptr_custom& operator=(const shared_ptr_custom& copy) {
+			*this = const_cast<shared_ptr_custom&>(copy);
 		}
-		shared_ptr_custom& operator=(shared_ptr_custom&& copy) {
+
+		shared_ptr_custom& operator=(shared_ptr_custom& copy) {
 			if (this == &copy)return *this;
 			join(copy.total);
 			ptr = copy.ptr;
@@ -61,6 +53,7 @@ namespace tmgr {
 		T* get() {
 			return ptr;
 		}
+
 	};
 }
 #endif

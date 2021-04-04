@@ -5,14 +5,13 @@
 #include "spin_lock.hpp"
 #include <list>
 
-
 namespace tmgr {
 	class thread_object_t {
 		friend class broadcast_event_class<thread_object_t>;
 
 
-		bool destructed : 1;
 		bool async_result : 1;
+		std::atomic_bool destructed;
 		std::atomic_flag wait_async_the_thread_result;
 		thread_context_t* thread_handle;
 		shadow_spin_lock async_result_lock;
@@ -21,12 +20,12 @@ namespace tmgr {
 
 
 		void handle() {
-			if (thread_handle->current_status == thread_status::end_of_life)
-				destructed = 1;
+			destructed = current_context->current_status == thread_status::end_of_life;
+
 			if (async_result)
-				if (thread_handle->current_status == thread_status::has_solve) {
+				if (current_context->current_status == thread_status::has_solve) {
 					async_result_lock.lock();
-					result_list.emplace_back(thread_handle->thread_result);
+					result_list.emplace_back(current_context->thread_result);
 					async_result_lock.unlock();
 					wait_async_the_thread_result.clear();
 				}
@@ -35,13 +34,15 @@ namespace tmgr {
 		void prepare_result() {
 			if (destructed) throw thread_exception("Thread death");
 			if (async_result) {
-				current_context->broadcast_status(thread_status::wait);
+				if (current_context)
+					current_context->broadcast_status(thread_status::wait);
 				wait_async_the_thread_result.test_and_set(std::memory_order_acquire);
 				while (wait_async_the_thread_result.test_and_set(std::memory_order_acquire)) {
 					if (destructed) break;
 					std::this_thread::sleep_for(std::chrono::microseconds(15));
 				}
-				current_context->broadcast_status(thread_status::work);
+				if (current_context)
+					current_context->broadcast_status(thread_status::work);
 			}
 			else result_list.emplace_back(get_result(*thread_handle));
 		}
@@ -54,51 +55,108 @@ namespace tmgr {
 			async_result = 0;
 			if (thread_handle) {
 				thread_handle->sub_status(tmp);
-				destructed = 0;
 			}else destructed = 1;
+		}
+
+
+		thread_object_t& operator=(thread_object_t& thread) {
+			if (!destructed) 
+				thread_handle->unsub_status(tmp);
+			
+
+			async_result = thread.async_result;
+
+			destructed.store(thread.destructed);
+
+			wait_async_the_thread_result.clear();
+			if(thread.wait_async_the_thread_result.test())
+				wait_async_the_thread_result.test_and_set(std::memory_order_acquire);
+
+			thread_handle = thread.thread_handle;
+
+			async_result_lock = thread.async_result_lock;
+
+
+			if (!destructed)
+				thread_handle->sub_status(tmp);
+
+			result_list.clear();
+			for (shared_ptr_custom<void>& inter : thread.result_list)
+				result_list.push_back(inter);
+			return *this;
+		}
+
+		inline thread_object_t& operator=(thread_object_t&& thread) {
+			return *this = thread;
+		}
+		inline thread_object_t& operator=(thread_context_t& thread) {
+			return *this = thread_object_t(thread);
 		}
 
 		thread_status getStatus() {
 			if (!this)return thread_status::none;
 			if (destructed) return thread_status::end_of_life;
-			else return thread_handle->current_status;
+			else return thread_handle->get_status();
 		}
-
-		inline void pause() noexcept {
-			lock();
+		
+		inline void pause() {
+			if (!destructed) thread_handle->lock();
 		}
-		inline void continueTh() noexcept {
-			unlock();
+		inline void continueTh() {
+			if (!destructed) thread_handle->unlock();
 		}
-
-		void lock() noexcept {
-			if (!destructed) thread_handle->is_pause.test_and_set(std::memory_order_acquire);
+		inline void lock() {
+			if (!destructed) thread_handle->lock();
 		}
-		void unlock() noexcept {
-			if (!destructed) thread_handle->is_pause.clear();
+		inline void unlock() {
+			if (!destructed) thread_handle->unlock();
 		}
-
+		
 		void wait(thread_status need_status_type) {
 			if (destructed)return;
 			std::atomic_flag lock_flag;
 			lock_flag.test_and_set(std::memory_order_acquire);
 
-			broadcast_event_lambda tmpy([&]() {
-				if (thread_handle->current_status == thread_status::end_of_life)
-					destructed = 1;
-				if (thread_handle->current_status == need_status_type || thread_handle->current_status == thread_status::end_of_life)
-					lock_flag.clear();
+
+			//======================
+			//for self unsub
+			void* tmpy;
+
+
+
+			struct {
+				std::atomic_flag* lock_flag;
+				void*& tmpy;
+				thread_status need_status_type;
+			} link(&lock_flag, tmpy, need_status_type);
+
+			broadcast_event_function tempy([&](auto tmp) {
+					if (!current_context)
+						return;
+					if (current_context->current_status == tmp.need_status_type || current_context->current_status == thread_status::end_of_life) {
+						current_context->unsub_status(*(broadcast_event*)tmp.tmpy);
+						tmp.lock_flag->clear();
+					}
 				}
+				, link
 			);
-			if (!destructed)thread_handle->sub_status(tmpy);
-			while (lock_flag.test_and_set(std::memory_order_acquire)) {
+			tmpy = &tempy;
+
+			//======================
+			if (!destructed)
+				thread_handle->sub_status(*(broadcast_event*)tmpy);
+
+			if (current_context)
 				current_context->broadcast_status(thread_status::wait);
-				if (destructed) break;
+
+			while (lock_flag.test(std::memory_order_acquire)) 
 				std::this_thread::sleep_for(std::chrono::microseconds(15));
-			}
-			current_context->broadcast_status(thread_status::work);
-			if (!destructed)thread_handle->unsub_status(tmpy);
-			else if (need_status_type != thread_status::end_of_life) throw thread_exception("Thread death");
+
+			if (current_context)
+				current_context->broadcast_status(thread_status::work);
+
+			else if (need_status_type != thread_status::end_of_life)
+				throw thread_exception("Thread death");
 		}
 
 		void subResultHandle(bool swithcer) {
@@ -115,7 +173,7 @@ namespace tmgr {
 				prepare_result();
 		}
 
-		//	just read first result
+
 		template<class T>
 		T getNewResult() {
 			prepare_result();
@@ -123,7 +181,7 @@ namespace tmgr {
 			return *(T*)result_list.front().get();
 		}
 
-		//	read and remove first result
+
 		template<class T>
 		T takeNewResult() {
 			prepare_result();
@@ -152,7 +210,8 @@ namespace tmgr {
 		}
 
 		void abort() {
-			thread_handle->abort = 1;
+			if(!destructed)
+				thread_handle->_abort = 1;
 		}
 
 		bool isDeath() const {
@@ -163,14 +222,25 @@ namespace tmgr {
 		}
 		std::thread::id getID() const {
 			if (destructed) throw thread_exception("Thread death");
-			return thread_handle->current;
+			return thread_handle->get_id();
 		}
 		bool resultIsAsync() const {
 			return async_result;
 		}
-
+		thread_context_t& get_context() const{
+			if(destructed) 
+				throw thread_exception("Thread destructed");
+			return *thread_handle;
+		}
+		
+		
+		
+		
+		
+		
+		
 		~thread_object_t() {
-			if (!destructed)
+			if (!destructed) 
 				thread_handle->unsub_status(tmp);
 		}
 	};

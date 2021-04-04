@@ -16,20 +16,76 @@ namespace tmgr {
 			tmp = copy.tmp;
 		}
 		void lock() {
-			while (lock_flag.test_and_set(std::memory_order_acquire)) {
+			if(current_context)
 				current_context->broadcast_status(thread_status::lock);
+			while (lock_flag.test_and_set(std::memory_order_acquire))
 				std::this_thread::sleep_for(std::chrono::microseconds(15));
-			}
+			
 			tmp = std::this_thread::get_id();
-			current_context->broadcast_status(thread_status::work);
+			if (current_context)
+				current_context->broadcast_status(thread_status::work);
 		}
 		bool try_lock() {
-			return !lock_flag.test_and_set(std::memory_order_acquire);
+			if (lock_flag.test_and_set(std::memory_order_acquire))
+				return 0;
+			tmp = std::this_thread::get_id();
+			return 1;
 		}
+
+		template <class _Rep, class _Period>
+		bool try_lock_for(const std::chrono::duration<_Rep, _Period>& _Rel_time) {
+			auto end = std::chrono::system_clock::now();
+			end += _Rel_time;
+
+			if (current_context)
+				current_context->broadcast_status(thread_status::lock);
+			while (lock_flag.test_and_set(std::memory_order_acquire)) {
+				std::this_thread::sleep_for(std::chrono::microseconds(15));
+				if (end <= std::chrono::system_clock::now()){
+					if (current_context)
+						current_context->broadcast_status(thread_status::work);
+					return 0;
+				}
+			}
+
+			tmp = std::this_thread::get_id();
+			if (current_context)
+				current_context->broadcast_status(thread_status::work);
+			return 1;
+		}
+
+		template <class _Clock, class _Duration>
+		bool try_lock_until(const std::chrono::time_point<_Clock, _Duration>& _Abs_time) {
+			if (current_context)
+				current_context->broadcast_status(thread_status::lock);
+			while (lock_flag.test_and_set(std::memory_order_acquire)) {
+				std::this_thread::sleep_for(std::chrono::microseconds(15));
+				if (_Abs_time <= std::chrono::system_clock::now()) {
+					if (current_context)
+						current_context->broadcast_status(thread_status::work);
+					return 0;
+				}
+			}
+
+			tmp = std::this_thread::get_id();
+			if (current_context)
+				current_context->broadcast_status(thread_status::work);
+			return 1;
+		}
+
+
+
 		void unlock() {
-			if (tmp != std::this_thread::get_id()) throw std::exception("Dissallowed unlock");
+			if (tmp != std::this_thread::get_id())
+				throw std::exception("Dissallowed unlock");
+			tmp = std::thread::id();
 			lock_flag.clear();
 		}
+
+		std::thread::id locker_id() {
+			return tmp;
+		}
+
 	};
 
 	template<class T>
